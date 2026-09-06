@@ -19,27 +19,35 @@ from pathlib import Path
 
 import requests
 
+# ไฟล์ปลายทางที่จะเก็บประวัติอัตราแลกเปลี่ยน (อยู่โฟลเดอร์เดียวกับสคริปต์นี้)
 OUTPUT_FILE = Path(__file__).parent / "usd_thb_rates.txt"
-LOOKBACK_DAYS = 10  # buffer to cover weekends/holidays when BOT publishes no rate
-BE_OFFSET = 543  # Buddhist Era = Gregorian year + 543
+# จำนวนวันย้อนหลังที่จะขอข้อมูล เผื่อกรณีวันหยุด/เสาร์-อาทิตย์ที่ ธปท. ไม่ประกาศอัตรา
+LOOKBACK_DAYS = 10
+# ปี พ.ศ. = ปี ค.ศ. + 543 (URL ของ ธปท. ใช้ปี พ.ศ.)
+BE_OFFSET = 543
 
+# ตารางแปลงชื่อเดือนไทยแบบย่อ -> เลขเดือน (ใช้กับฟิลด์ "period" เช่น "04 ก.ย. 2569")
 THAI_MONTHS = {
     "ม.ค.": 1, "ก.พ.": 2, "มี.ค.": 3, "เม.ย.": 4,
     "พ.ค.": 5, "มิ.ย.": 6, "ก.ค.": 7, "ส.ค.": 8,
     "ก.ย.": 9, "ต.ค.": 10, "พ.ย.": 11, "ธ.ค.": 12,
 }
 
+# ตารางแปลงชื่อเดือนไทยแบบเต็ม -> เลขเดือน (ใช้กับฟิลด์ "date" เช่น "ประจำวันที่ 04 กันยายน 2569")
 THAI_MONTHS_FULL = {
     "มกราคม": 1, "กุมภาพันธ์": 2, "มีนาคม": 3, "เมษายน": 4,
     "พฤษภาคม": 5, "มิถุนายน": 6, "กรกฎาคม": 7, "สิงหาคม": 8,
     "กันยายน": 9, "ตุลาคม": 10, "พฤศจิกายน": 11, "ธันวาคม": 12,
 }
 
+# endpoint ของ "อัตราแลกเปลี่ยนถัวเฉลี่ยถ่วงน้ำหนักระหว่างธนาคาร" (weighted-average rate)
+# endpoint นี้ไม่ต้องใส่ช่วงวันที่ในตัว URL เพราะเซิร์ฟเวอร์จะคืนค่าล่าสุดให้เสมอ
 WEIGHTED_AVERAGE_URL = (
     "https://www.bot.or.th/content/bot/th/statistics/exchange-rate/"
     "jcr:content/root/container/statisticstable2.results.level3cache.json"
 )
 
+# ใส่ User-Agent ปลอมเป็นเบราว์เซอร์ทั่วไป กัน ธปท. บล็อกคำขอที่ไม่มี header นี้
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -49,80 +57,113 @@ HEADERS = {
 
 
 def be_date_str(d: date) -> str:
+    # แปลงวันที่ (ปี ค.ศ.) เป็นสตริงรูปแบบ YYYY-MM-DD แต่ใช้ปี พ.ศ. ตามที่ URL ของ ธปท. ต้องการ
     return f"{d.year + BE_OFFSET:04d}-{d.month:02d}-{d.day:02d}"
 
 
 def thai_period_to_iso(period: str) -> str:
     # e.g. "04 ก.ย. 2569" -> "2026-09-04"
+    # 1) แยกสตริงด้วยช่องว่างเป็น วัน / เดือน(ย่อ) / ปี(พ.ศ.)
     day_str, month_str, year_str = period.split()
+    # 2) แปลงวันเป็นตัวเลข
     day = int(day_str)
+    # 3) แปลงชื่อเดือนไทยย่อเป็นเลขเดือนจากตาราง THAI_MONTHS
     month = THAI_MONTHS[month_str]
+    # 4) แปลงปี พ.ศ. กลับเป็นปี ค.ศ.
     year = int(year_str) - BE_OFFSET
+    # 5) ประกอบกลับเป็นรูปแบบวันที่สากล YYYY-MM-DD
     return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def thai_full_date_to_iso(text: str) -> str:
     # e.g. "ประจำวันที่ 04 กันยายน 2569" -> "2026-09-04"
+    # 1) ใช้ regex ดึงเฉพาะส่วน "วัน เดือน(เต็ม) ปี" ออกจากประโยคภาษาไทย
     match = re.search(r"(\d{1,2})\s+(\S+)\s+(\d{4})", text)
     if not match:
         raise ValueError(f"Could not parse Thai date from: {text!r}")
     day, month_name, year = match.groups()
+    # 2) แปลงชื่อเดือนไทยแบบเต็มเป็นเลขเดือนจากตาราง THAI_MONTHS_FULL
     month = THAI_MONTHS_FULL[month_name]
+    # 3) แปลงปี พ.ศ. เป็น ค.ศ. แล้วประกอบเป็นรูปแบบ YYYY-MM-DD
     return f"{int(year) - BE_OFFSET:04d}-{month:02d}-{int(day):02d}"
 
 
 def fetch_latest_usd_rate() -> dict:
+    # ขั้นตอนการดึงอัตราซื้อ/ขายเงินดอลลาร์ (buying/selling) ล่าสุดจาก ธปท.
+
+    # 1) คำนวณช่วงวันที่ที่จะขอข้อมูล: ตั้งแต่ (วันนี้ - LOOKBACK_DAYS) ถึงวันนี้
     today = date.today()
     start = today - timedelta(days=LOOKBACK_DAYS)
 
+    # 2) ประกอบ URL ของ API โดยแปลงวันที่เริ่มต้น/สิ้นสุดเป็นรูปแบบปี พ.ศ. ตามที่ ธปท. ต้องการ
     url = (
         "https://www.bot.or.th/content/bot/th/statistics/exchange-rate/"
         "jcr:content/root/container/statisticstable1.results.level3cache."
         f"daily.{be_date_str(start)}.{be_date_str(today)}.USD.json"
     )
 
+    # 3) ยิง GET request ไปยัง API และเช็คว่าไม่มี error (เช่น 4xx/5xx)
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
+    # 4) แปลง response body ที่เป็น JSON string ให้เป็น dict ของ Python
     data = resp.json()
 
+    # 5) ดึงรายการอัตราแลกเปลี่ยนแต่ละวันออกมาจาก key "responseContent"
     entries = data.get("responseContent", [])
     if not entries:
+        # ถ้าไม่มีข้อมูลเลยในช่วงวันที่ที่ขอ ให้โยน error ออกไปทันที
         raise RuntimeError(f"No exchange rate data returned for range {start} to {today}")
 
-    # Entries come back most-recent-first; sort defensively just in case.
+    # 6) เรียงรายการตามวันที่จากมากไปน้อย (ป้องกันกรณี API ไม่ได้เรียงลำดับมาให้)
     entries.sort(key=lambda e: thai_period_to_iso(e["period"]), reverse=True)
+    # 7) คืนค่ารายการแรก ซึ่งคือวันที่ล่าสุดที่มีข้อมูล
     return entries[0]
 
 
 def fetch_weighted_average_rate() -> tuple[str, str]:
     """Return (iso_date, rate) for the weighted-average interbank USD/THB rate."""
+    # ขั้นตอนการดึง "อัตราแลกเปลี่ยนถัวเฉลี่ยถ่วงน้ำหนักระหว่างธนาคาร" (weighted-average rate)
+
+    # 1) ยิง GET request ไปยัง endpoint คงที่ (ไม่ต้องระบุช่วงวันที่ เพราะคืนค่าล่าสุดเสมอ)
     resp = requests.get(WEIGHTED_AVERAGE_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
+    # 2) ตัวเลขอัตราถ่วงน้ำหนักไม่ได้มาเป็นฟิลด์แยก แต่ฝังอยู่ใน HTML ข้อความ
+    #    ในฟิลด์ "description" เช่น "...ถ่วงน้ำหนักระหว่างธนาคาร <span>32.932</span> บาท..."
+    #    จึงต้องใช้ regex ดึงตัวเลขทศนิยมตัวแรกที่เจอออกมา
     rate_match = re.search(r"(\d+\.\d+)", data["description"])
     if not rate_match:
         raise RuntimeError(f"Could not find weighted-average rate in: {data['description']!r}")
 
+    # 3) แปลงฟิลด์ "date" (ข้อความวันที่แบบเต็มภาษาไทย) ให้เป็นรูปแบบ YYYY-MM-DD
     iso_date = thai_full_date_to_iso(data["date"])
+    # 4) คืนค่าเป็นคู่ (วันที่, อัตราถ่วงน้ำหนัก) ให้ผู้เรียกใช้งานต่อ
     return iso_date, rate_match.group(1)
 
 
 def append_rate_to_file(entry: dict, weighted_average: str | None) -> None:
+    # ขั้นตอนการต่อท้าย (append) ข้อมูลอัตราแลกเปลี่ยนของวันนั้นลงไฟล์ txt
+
+    # 1) แปลงวันที่ของ entry ให้เป็นรูปแบบ YYYY-MM-DD และดึงค่าอัตราซื้อโอน/ขายออกมา
     iso_date = thai_period_to_iso(entry["period"])
     buying_transfer = entry["buying_transfer"]
     selling = entry["selling"]
 
+    # 2) ประกอบเป็นบรรทัดข้อความ 1 บรรทัด รวมทั้งอัตราถ่วงน้ำหนัก (ถ้ามี)
     line = (
         f"{iso_date},USD,buying_transfer={buying_transfer},selling={selling},"
         f"weighted_average={weighted_average}\n"
     )
 
+    # 3) อ่านไฟล์เดิม (ถ้ามี) เพื่อตรวจสอบว่าวันที่นี้เคยถูกบันทึกไว้แล้วหรือยัง
     existing = OUTPUT_FILE.read_text(encoding="utf-8") if OUTPUT_FILE.exists() else ""
     if f"{iso_date},USD," in existing:
+        # ถ้ามีอยู่แล้ว ให้ข้ามการเขียนซ้ำ (กันข้อมูลซ้ำเวลารันสคริปต์หลายรอบต่อวัน)
         print(f"Rate for {iso_date} already recorded, skipping.")
         return
 
+    # 4) เปิดไฟล์ในโหมด append ("a") แล้วเขียนบรรทัดใหม่ต่อท้ายไฟล์
     with OUTPUT_FILE.open("a", encoding="utf-8") as f:
         f.write(line)
 
@@ -130,20 +171,28 @@ def append_rate_to_file(entry: dict, weighted_average: str | None) -> None:
 
 
 def main() -> None:
+    # ขั้นตอนหลักของสคริปต์ เรียกทำงานตามลำดับดังนี้:
+
+    # 1) ดึงอัตราซื้อ/ขายเงินดอลลาร์ล่าสุด
     entry = fetch_latest_usd_rate()
 
+    # 2) พยายามดึงอัตราถ่วงน้ำหนักล่าสุดเพิ่มเติม (ถ้าดึงไม่ได้ก็ไม่ทำให้สคริปต์ล้มเหลวทั้งหมด)
     weighted_average = None
     try:
         wa_date, wa_rate = fetch_weighted_average_rate()
+        # 3) ใช้อัตราถ่วงน้ำหนักเฉพาะกรณีที่วันที่ตรงกับอัตราซื้อ/ขายที่ดึงมาในขั้นตอนที่ 1 เท่านั้น
         if wa_date == thai_period_to_iso(entry["period"]):
             weighted_average = wa_rate
         else:
             print(f"Weighted-average rate is for {wa_date}, not {thai_period_to_iso(entry['period'])}; skipping it.")
     except Exception as exc:
+        # ถ้าดึงอัตราถ่วงน้ำหนักไม่สำเร็จ (เช่น เว็บเปลี่ยนโครงสร้าง) ให้แจ้งเตือนแล้วทำงานต่อโดยไม่มีค่านี้
         print(f"Could not fetch weighted-average rate: {exc}")
 
+    # 4) บันทึกผลลัพธ์ทั้งหมดลงไฟล์ txt
     append_rate_to_file(entry, weighted_average)
 
 
 if __name__ == "__main__":
+    # จุดเริ่มต้นเมื่อรันไฟล์นี้โดยตรง (เช่น `python scrape_bot_rate.py`)
     main()
