@@ -1,14 +1,14 @@
 """
-Scrape the USD/THB exchange rate published by the Bank of Thailand
-(https://www.bot.or.th/th/statistics/exchange-rate.html) and append the
-latest rate to a text file, one line per day.
+Scrape the USD/THB and KRW/THB exchange rates published by the Bank of
+Thailand (https://www.bot.or.th/th/statistics/exchange-rate.html) and append
+the latest rate of each currency to its own text file, one line per day.
 
 The page itself renders its table with JavaScript, but the table is backed
 by a plain JSON endpoint that we can call directly:
 
   https://www.bot.or.th/content/bot/th/statistics/exchange-rate/jcr:content/
   root/container/statisticstable1.results.level3cache.daily.
-  {start:BE-date}.{end:BE-date}.USD.json
+  {start:BE-date}.{end:BE-date}.{CURRENCY}.json
 
 Run it daily (e.g. with Windows Task Scheduler) to build up a history file.
 """
@@ -19,8 +19,11 @@ from pathlib import Path
 
 import requests
 
-# ไฟล์ปลายทางที่จะเก็บประวัติอัตราแลกเปลี่ยน (อยู่โฟลเดอร์เดียวกับสคริปต์นี้)
-OUTPUT_FILE = Path(__file__).parent / "usd_thb_rates.txt"
+# ไฟล์ปลายทางที่จะเก็บประวัติอัตราแลกเปลี่ยนของแต่ละสกุลเงิน (อยู่โฟลเดอร์เดียวกับสคริปต์นี้)
+OUTPUT_FILES = {
+    "USD": Path(__file__).parent / "usd_thb_rates.txt",
+    "KRW": Path(__file__).parent / "krw_thb_rates.txt",
+}
 # จำนวนวันย้อนหลังที่จะขอข้อมูล เผื่อกรณีวันหยุด/เสาร์-อาทิตย์ที่ ธปท. ไม่ประกาศอัตรา
 LOOKBACK_DAYS = 10
 # ปี พ.ศ. = ปี ค.ศ. + 543 (URL ของ ธปท. ใช้ปี พ.ศ.)
@@ -88,8 +91,9 @@ def thai_full_date_to_iso(text: str) -> str:
     return f"{int(year) - BE_OFFSET:04d}-{month:02d}-{int(day):02d}"
 
 
-def fetch_latest_usd_rate() -> dict:
-    # ขั้นตอนการดึงอัตราซื้อ/ขายเงินดอลลาร์ (buying/selling) ล่าสุดจาก ธปท.
+def fetch_latest_rate(currency: str) -> dict:
+    # ขั้นตอนการดึงอัตราซื้อ/ขายเงินสกุลที่ระบุ (buying/selling) ล่าสุดจาก ธปท.
+    # หมายเหตุ: สำหรับสกุลเงินมูลค่าน้อยอย่างเงินวอนเกาหลี (KRW) ธปท. จะประกาศอัตราต่อ 100 หน่วย
 
     # 1) คำนวณช่วงวันที่ที่จะขอข้อมูล: ตั้งแต่ (วันนี้ - LOOKBACK_DAYS) ถึงวันนี้
     today = date.today()
@@ -99,7 +103,7 @@ def fetch_latest_usd_rate() -> dict:
     url = (
         "https://www.bot.or.th/content/bot/th/statistics/exchange-rate/"
         "jcr:content/root/container/statisticstable1.results.level3cache."
-        f"daily.{be_date_str(start)}.{be_date_str(today)}.USD.json"
+        f"daily.{be_date_str(start)}.{be_date_str(today)}.{currency}.json"
     )
 
     # 3) ยิง GET request ไปยัง API และเช็คว่าไม่มี error (เช่น 4xx/5xx)
@@ -112,7 +116,7 @@ def fetch_latest_usd_rate() -> dict:
     entries = data.get("responseContent", [])
     if not entries:
         # ถ้าไม่มีข้อมูลเลยในช่วงวันที่ที่ขอ ให้โยน error ออกไปทันที
-        raise RuntimeError(f"No exchange rate data returned for range {start} to {today}")
+        raise RuntimeError(f"No {currency} exchange rate data returned for range {start} to {today}")
 
     # 6) เรียงรายการตามวันที่จากมากไปน้อย (ป้องกันกรณี API ไม่ได้เรียงลำดับมาให้)
     entries.sort(key=lambda e: thai_period_to_iso(e["period"]), reverse=True)
@@ -142,8 +146,10 @@ def fetch_weighted_average_rate() -> tuple[str, str]:
     return iso_date, rate_match.group(1)
 
 
-def append_rate_to_file(entry: dict, weighted_average: str | None) -> None:
-    # ขั้นตอนการต่อท้าย (append) ข้อมูลอัตราแลกเปลี่ยนของวันนั้นลงไฟล์ txt
+def append_rate_to_file(currency: str, entry: dict, weighted_average: str | None) -> None:
+    # ขั้นตอนการต่อท้าย (append) ข้อมูลอัตราแลกเปลี่ยนของวันนั้นลงไฟล์ txt ของสกุลเงินนั้น ๆ
+
+    output_file = OUTPUT_FILES[currency]
 
     # 1) แปลงวันที่ของ entry ให้เป็นรูปแบบ YYYY-MM-DD และดึงค่าอัตราซื้อโอน/ขายออกมา
     iso_date = thai_period_to_iso(entry["period"])
@@ -152,45 +158,53 @@ def append_rate_to_file(entry: dict, weighted_average: str | None) -> None:
 
     # 2) ประกอบเป็นบรรทัดข้อความ 1 บรรทัด รวมทั้งอัตราถ่วงน้ำหนัก (ถ้ามี)
     line = (
-        f"{iso_date},USD,buying_transfer={buying_transfer},selling={selling},"
+        f"{iso_date},{currency},buying_transfer={buying_transfer},selling={selling},"
         f"weighted_average={weighted_average}\n"
     )
 
     # 3) อ่านไฟล์เดิม (ถ้ามี) เพื่อตรวจสอบว่าวันที่นี้เคยถูกบันทึกไว้แล้วหรือยัง
-    existing = OUTPUT_FILE.read_text(encoding="utf-8") if OUTPUT_FILE.exists() else ""
-    if f"{iso_date},USD," in existing:
+    existing = output_file.read_text(encoding="utf-8") if output_file.exists() else ""
+    if f"{iso_date},{currency}," in existing:
         # ถ้ามีอยู่แล้ว ให้ข้ามการเขียนซ้ำ (กันข้อมูลซ้ำเวลารันสคริปต์หลายรอบต่อวัน)
-        print(f"Rate for {iso_date} already recorded, skipping.")
+        print(f"Rate for {iso_date} ({currency}) already recorded, skipping.")
         return
 
     # 4) เปิดไฟล์ในโหมด append ("a") แล้วเขียนบรรทัดใหม่ต่อท้ายไฟล์
-    with OUTPUT_FILE.open("a", encoding="utf-8") as f:
+    with output_file.open("a", encoding="utf-8") as f:
         f.write(line)
 
     print(f"Appended: {line.strip()}")
 
 
 def main() -> None:
-    # ขั้นตอนหลักของสคริปต์ เรียกทำงานตามลำดับดังนี้:
+    # ขั้นตอนหลักของสคริปต์: ดึงอัตราแลกเปลี่ยนของแต่ละสกุลเงินที่ตั้งค่าไว้ใน OUTPUT_FILES แล้วบันทึกลงไฟล์
 
-    # 1) ดึงอัตราซื้อ/ขายเงินดอลลาร์ล่าสุด
-    entry = fetch_latest_usd_rate()
+    for currency in OUTPUT_FILES:
+        try:
+            # 1) ดึงอัตราซื้อ/ขายเงินสกุลนั้นล่าสุด
+            entry = fetch_latest_rate(currency)
+        except Exception as exc:
+            # ถ้าดึงอัตราของสกุลเงินนี้ไม่สำเร็จ ให้แจ้งเตือนแล้วข้ามไปทำสกุลเงินถัดไป
+            print(f"Could not fetch {currency} rate: {exc}")
+            continue
 
-    # 2) พยายามดึงอัตราถ่วงน้ำหนักล่าสุดเพิ่มเติม (ถ้าดึงไม่ได้ก็ไม่ทำให้สคริปต์ล้มเหลวทั้งหมด)
-    weighted_average = None
-    try:
-        wa_date, wa_rate = fetch_weighted_average_rate()
-        # 3) ใช้อัตราถ่วงน้ำหนักเฉพาะกรณีที่วันที่ตรงกับอัตราซื้อ/ขายที่ดึงมาในขั้นตอนที่ 1 เท่านั้น
-        if wa_date == thai_period_to_iso(entry["period"]):
-            weighted_average = wa_rate
-        else:
-            print(f"Weighted-average rate is for {wa_date}, not {thai_period_to_iso(entry['period'])}; skipping it.")
-    except Exception as exc:
-        # ถ้าดึงอัตราถ่วงน้ำหนักไม่สำเร็จ (เช่น เว็บเปลี่ยนโครงสร้าง) ให้แจ้งเตือนแล้วทำงานต่อโดยไม่มีค่านี้
-        print(f"Could not fetch weighted-average rate: {exc}")
+        # 2) อัตราถ่วงน้ำหนักระหว่างธนาคารมีประกาศเฉพาะสกุลเงินดอลลาร์สหรัฐเท่านั้น
+        weighted_average = None
+        if currency == "USD":
+            # พยายามดึงอัตราถ่วงน้ำหนักล่าสุดเพิ่มเติม (ถ้าดึงไม่ได้ก็ไม่ทำให้สคริปต์ล้มเหลวทั้งหมด)
+            try:
+                wa_date, wa_rate = fetch_weighted_average_rate()
+                # ใช้อัตราถ่วงน้ำหนักเฉพาะกรณีที่วันที่ตรงกับอัตราซื้อ/ขายที่ดึงมาข้างต้นเท่านั้น
+                if wa_date == thai_period_to_iso(entry["period"]):
+                    weighted_average = wa_rate
+                else:
+                    print(f"Weighted-average rate is for {wa_date}, not {thai_period_to_iso(entry['period'])}; skipping it.")
+            except Exception as exc:
+                # ถ้าดึงอัตราถ่วงน้ำหนักไม่สำเร็จ (เช่น เว็บเปลี่ยนโครงสร้าง) ให้แจ้งเตือนแล้วทำงานต่อโดยไม่มีค่านี้
+                print(f"Could not fetch weighted-average rate: {exc}")
 
-    # 4) บันทึกผลลัพธ์ทั้งหมดลงไฟล์ txt
-    append_rate_to_file(entry, weighted_average)
+        # 3) บันทึกผลลัพธ์ของสกุลเงินนี้ลงไฟล์ txt ของตัวเอง
+        append_rate_to_file(currency, entry, weighted_average)
 
 
 if __name__ == "__main__":
